@@ -17,8 +17,8 @@ set -eu
 
 # ---- Configuration (surchargeable par l'environnement) ----------------------
 # OUT doit pointer dans le CUSTOM_PROTOS_DIR de votre build dnsteerd
-# (défaut public /etc/dnsteerd/protocols.d ; profil ProgiBox
-#  /var/lib/progibox/protocols.d → poser M365_OUT en conséquence).
+# (défaut /etc/dnsteerd/protocols.d) ; adaptez M365_OUT si votre intégration
+# utilise un autre répertoire.
 GUID="${M365_GUID:-b10c5ed1-bad1-445f-b386-b919946339a7}"   # clientrequestid stable
 OUT="${M365_OUT:-/etc/dnsteerd/protocols.d/microsoft365.txt}"
 CACHE="${M365_CACHE:-/etc/dnsteerd/protocols.d/.m365.version}"
@@ -28,6 +28,12 @@ CATEGORIES="${M365_CATEGORIES:-Optimize,Allow}"   # catégories MS retenues (bre
 # défaut : la catégorie Default (où vit tout le CDN/update Office) n'est de
 # toute façon pas prise ci-dessus. À renseigner si vous ajoutez 'Default'.
 EXCLUDE="${M365_EXCLUDE:-}"
+# Reload dnsteerd après une MAJ effective (uniquement si la liste a changé).
+# DNSTEERD = binaire (PATH ou chemin complet). M365_RELOAD = commande de reload
+# personnalisée (ex. "systemctl restart dnsteerd") ; vide → reload générique
+# intégré (boot + relance du daemon par pkill, fonctionne avec inittab respawn
+# comme avec systemd Restart=, sans dépendre d'un pidfile).
+DNSTEERD="${M365_DNSTEERD:-dnsteerd}"
 BASE="https://endpoints.office.com"
 
 # Mappe une serviceArea Microsoft -> nom de protocole nDPI (augmente les protos
@@ -93,4 +99,16 @@ mkdir -p "$(dirname "$OUT")"
 [ -n "$latest" ] && printf '%s\n' "$latest" > "$CACHE"
 
 echo "m365-sync: $(printf '%s\n' "$body" | wc -l) protocole(s) M365 -> $OUT (version ${latest:-?})"
+
+# 5) Reload dnsteerd (liste changée). Personnalisé via M365_RELOAD, sinon
+#    reload générique : boot (sets/JSON à jour) puis relance du daemon — son
+#    superviseur (inittab respawn / systemd Restart) le redémarre, et il
+#    recharge alors le conf.d donc les nouveaux domaines.
+if [ -n "${M365_RELOAD:-}" ]; then
+    eval "$M365_RELOAD"
+else
+    "$DNSTEERD" boot >/dev/null 2>&1 || true
+    pkill -x dnsteerd 2>/dev/null || true
+fi
+
 exit 0

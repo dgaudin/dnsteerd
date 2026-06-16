@@ -28,6 +28,14 @@
 #define CUSTOM_PROTOS_PATH  "/etc/dnsteerd/custom_protocols.txt"
 #endif
 
+/* Répertoire « conf.d » de protocoles custom additionnels, chargés EN PLUS
+ * de CUSTOM_PROTOS_PATH (chaque *.txt). Permet à une source auto-synchronisée
+ * (ex. domaines Microsoft 365) de vivre dans son propre fichier sans toucher
+ * au custom_protocols principal — absent = simplement ignoré. */
+#ifndef CUSTOM_PROTOS_DIR
+#define CUSTOM_PROTOS_DIR   "/etc/dnsteerd/protocols.d"
+#endif
+
 /* Table nftables hébergeant les sets ndpi_v4_<id>. Par défaut une table
  * dédiée, créée par `dnsteerd boot` ; une intégration peut pointer la
  * table existante de son pare-feu. */

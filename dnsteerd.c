@@ -52,6 +52,7 @@
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <getopt.h>
+#include <dirent.h>
 #include <time.h>
 
 /* Netfilter / libmnl */
@@ -181,10 +182,48 @@ static struct ndpi_detection_module_struct *init_ndpi(void)
         ndpi_load_protocols_file(ctx, CUSTOM_PROTOS_PATH);
     }
 
+    /* conf.d : chaque *.txt de CUSTOM_PROTOS_DIR (ordre alpha), chargé EN PLUS.
+     * Sert aux sources auto-synchronisées (ex. domaines Microsoft 365) qui
+     * vivent dans leur propre fichier — répertoire absent = simplement ignoré. */
+    {
+        struct dirent **nl;
+        int n = scandir(CUSTOM_PROTOS_DIR, &nl, NULL, alphasort);
+        for (int i = 0; i < n; i++) {
+            const char *nm = nl[i]->d_name;
+            size_t l = strlen(nm);
+            if (l > 4 && strcmp(nm + l - 4, ".txt") == 0) {
+                char path[512];
+                snprintf(path, sizeof path, "%s/%s", CUSTOM_PROTOS_DIR, nm);
+                ndpi_load_protocols_file(ctx, path);
+            }
+            free(nl[i]);
+        }
+        if (n >= 0)
+            free(nl);
+    }
+
     /* Compilation des automates Aho-Corasick */
     ndpi_finalize_initialization(ctx);
 
     return ctx;
+}
+
+/* Liste générée (gen_dns_protocols.sh) des protocoles à signature DNS/host :
+ * les SEULS que dnsteerd peut peupler. Un protocole binaire/flux (TeamsCall
+ * via RTP/STUN, …) n'y figure pas → son set ne serait jamais peuplé. */
+#include "dns_protocols.inc"
+
+/* 1 si le protocole est routable par dnsteerd : signature host (liste
+ * générée) ou protocole custom (défini par des patterns host:"..."). */
+static int proto_is_routable(const char *name, int is_custom)
+{
+    if (is_custom)
+        return 1;
+    if (name)
+        for (size_t i = 0; i < sizeof(dnsteerd_host_protos) / sizeof(dnsteerd_host_protos[0]); i++)
+            if (strcmp(name, dnsteerd_host_protos[i]) == 0)
+                return 1;
+    return 0;
 }
 
 /* ================================================================
@@ -1003,8 +1042,23 @@ static int run_nft_script(const char *script)
 {
     struct nft_ctx *c = nft_ctx_new(NFT_CTX_DEFAULT);
     if (!c) return -1;
+    /* Capture la sortie d'erreur de nft pour la loguer : sinon l'échec est
+     * opaque (« échec ruleset nft » sans la cause réelle — ex. module
+     * nft_queue absent, syntaxe non supportée par la version nft installée). */
+    char *err = NULL;
+    size_t errlen = 0;
+    FILE *ef = open_memstream(&err, &errlen);
+    if (ef)
+        nft_ctx_set_error(c, ef);
     int rc = nft_run_cmd_from_buffer(c, script);
+    if (ef)
+        fflush(ef);
+    if (rc != 0 && err && *err)
+        syslog(LOG_WARNING, "nft: %s", err);
     nft_ctx_free(c);
+    if (ef)
+        fclose(ef);
+    free(err);
     return rc;
 }
 
@@ -1083,6 +1137,10 @@ static int do_boot(void)
         if (!defaults[i].isAppProtocol)
             continue;
         if (defaults[i].protoId == NDPI_PROTOCOL_UNKNOWN)
+            continue;
+        /* Routables seulement : pas de set pour un protocole binaire qui
+         * resterait à jamais vide (et invisible dans l'UI). */
+        if (!proto_is_routable(defaults[i].protoName, defaults[i].isCustomProto))
             continue;
 
         u_int16_t id = defaults[i].protoId;
@@ -1180,6 +1238,10 @@ static int do_daemon(int foreground)
         if (!defaults[i].isAppProtocol)
             continue;
         if (defaults[i].protoId == NDPI_PROTOCOL_UNKNOWN)
+            continue;
+        /* Cohérent avec le boot : on n'injecte que dans les sets créés
+         * (protocoles routables host/custom). */
+        if (!proto_is_routable(defaults[i].protoName, defaults[i].isCustomProto))
             continue;
         u_int16_t id = defaults[i].protoId;
         if (id < PROTO_TABLE_SIZE) {
