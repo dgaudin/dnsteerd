@@ -15,6 +15,16 @@
 # Régénération automatique : à lancer en cron (cf. README, section M365).
 set -eu
 
+# Dependances requises : curl + jq. Sans ce controle, leur absence se traduit
+# par une sortie vide silencieuse (les pipes plus bas redirigent stderr) et le
+# message trompeur « recuperation vide ». On echoue clairement a la place.
+for _bin in curl jq; do
+    command -v "$_bin" >/dev/null 2>&1 || {
+        echo "m365-sync: dependance manquante : '$_bin' introuvable dans le PATH" >&2
+        exit 1
+    }
+done
+
 # ---- Configuration (surchargeable par l'environnement) ----------------------
 # OUT doit pointer dans le CUSTOM_PROTOS_DIR de votre build dnsteerd
 # (défaut /etc/dnsteerd/protocols.d) ; adaptez M365_OUT si votre intégration
