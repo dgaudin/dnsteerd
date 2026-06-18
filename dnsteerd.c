@@ -128,6 +128,7 @@ static uint32_t           nft_seq = 0;
 static void   *flow_roots[FLOW_HASH_ROOTS];
 static int     g_flow_count = 0;
 static time_t  g_last_sweep = 0;
+static int     g_debug = 0;      /* -d : logs LOG_DEBUG (dont l'IP par host) */
 
 /* ================================================================
  * Helpers
@@ -424,6 +425,18 @@ static int set_add_elem(struct nftnl_set **ps, u_int16_t app_id,
     return 0;
 }
 
+/* Log DEBUG (option -d) : une ligne par IP réellement injectée (host → ip).
+ * En prod le masque syslog filtre LOG_DEBUG ; le test g_debug évite en plus
+ * l'inet_ntop inutile sur le chemin chaud. */
+static void dbg_inject(const char *host, u_int16_t app_id, int af, const void *ip)
+{
+    if (!g_debug)
+        return;
+    char s[INET6_ADDRSTRLEN];
+    if (inet_ntop(af, ip, s, sizeof s))
+        syslog(LOG_DEBUG, "%s → ndpi %u : %s", host ? host : "?", app_id, s);
+}
+
 /* Commit des éléments v4/v6 construits : UN batch
  * BEGIN | NEWSETELEM(v4) [| NEWSETELEM(v6)] | END sur le socket persistant.
  * Le batch nf_tables est TRANSACTIONNEL : un seul NLM_F_ACK, posé sur le
@@ -433,8 +446,7 @@ static int set_add_elem(struct nftnl_set **ps, u_int16_t app_id,
  * propre confirmation). Attend l'ACK AVANT de rendre la main → sets peuplés
  * avant le verdict. Consomme s4/s6 ; kind4/kind6 = libellés de log. */
 static void inject_commit(u_int16_t app_id, struct nftnl_set *s4, int c4,
-                          struct nftnl_set *s6, int c6, const char *host,
-                          const char *kind4, const char *kind6)
+                          struct nftnl_set *s6, int c6, const char *host)
 {
     /* Retours de batch_next contrôlés par principe : la borne réelle est en
      * amont (≤16 adresses nDPI / hints courts → ~2-4 Ko, marge ×2 minimum
@@ -502,16 +514,12 @@ static void inject_commit(u_int16_t app_id, struct nftnl_set *s4, int c4,
             continue;                   /* seq étranger = ACK résiduel : ignorer */
         break;                          /* MNL_CB_STOP = ACK ok ; -1 = NACK */
     }
-    if (ret == -1) {
+    if (ret == -1)
         syslog(LOG_WARNING, "%s → ndpi %u : nft setelem: %s",
                host, app_id, strerror(errno));
-    } else if (c4 && c6) {
-        syslog(LOG_INFO, "%s → ndpi %u : %d %s + %d %s",
-               host, app_id, c4, kind4, c6, kind6);
-    } else {
-        syslog(LOG_INFO, "%s → ndpi %u : %d %s",
-               host, app_id, c6 ? c6 : c4, c6 ? kind6 : kind4);
-    }
+    else
+        syslog(LOG_INFO, "%s → ndpi %u : %d IPv4 + %d IPv6 injectees",
+               host, app_id, c4, c6);
 
     /* Drainer d'éventuels ACK résiduels (non bloquant) → socket propre. */
     int fd = mnl_socket_get_fd(nft_nl);
@@ -519,34 +527,36 @@ static void inject_commit(u_int16_t app_id, struct nftnl_set *s4, int c4,
     while (recv(fd, dr, sizeof dr, MSG_DONTWAIT) > 0) { }
 }
 
-/* Injecte les A — et les AAAA si DNSTEERD_IPV6 — d'une réponse parsée
- * par nDPI. */
-static void inject_ips(u_int16_t app_id, struct ndpi_flow_struct *flow)
+/* Accumule les A — et les AAAA si DNSTEERD_IPV6 — d'une réponse parsée par
+ * nDPI dans les sets s4/s6 fournis. Le commit Netlink est fait UNE fois par
+ * l'appelant (cb_nfqueue), groupé avec les hints SVCB éventuels. */
+static void inject_ips(u_int16_t app_id, struct ndpi_flow_struct *flow,
+                       struct nftnl_set **ps4, int *pc4,
+                       struct nftnl_set **ps6, int *pc6)
 {
     int n = flow->protos.dns.num_rsp_addr;
-    if (n <= 0 || !nft_nl)
+    if (n <= 0)
         return;
-
-    struct nftnl_set *s4 = NULL, *s6 = NULL;
-    int c4 = 0, c6 = 0;
 
     for (int i = 0; i < n && i < MAX_NUM_DNS_RSP_ADDRESSES; i++) {
         u_int32_t ttl = flow->protos.dns.rsp_addr_ttl[i];
         if (flow->protos.dns.is_rsp_addr_ipv6[i]) {
             if (DNSTEERD_IPV6 &&
-                set_add_elem(&s6, app_id, SET_V6,
-                             &flow->protos.dns.rsp_addr[i].ipv6, 16, ttl) == 0)
-                c6++;
+                set_add_elem(ps6, app_id, SET_V6,
+                             &flow->protos.dns.rsp_addr[i].ipv6, 16, ttl) == 0) {
+                (*pc6)++;
+                dbg_inject(flow->host_server_name, app_id, AF_INET6,
+                           &flow->protos.dns.rsp_addr[i].ipv6);
+            }
         } else {
-            if (set_add_elem(&s4, app_id, SET_V4,
-                             &flow->protos.dns.rsp_addr[i].ipv4, 4, ttl) == 0)
-                c4++;
+            if (set_add_elem(ps4, app_id, SET_V4,
+                             &flow->protos.dns.rsp_addr[i].ipv4, 4, ttl) == 0) {
+                (*pc4)++;
+                dbg_inject(flow->host_server_name, app_id, AF_INET,
+                           &flow->protos.dns.rsp_addr[i].ipv4);
+            }
         }
     }
-
-    if (!s4 && !s6)
-        return;
-    inject_commit(app_id, s4, c4, s6, c6, flow->host_server_name, "A", "AAAA");
 }
 
 /* ---- HTTPS RR (type 65, RFC 9460) ----
@@ -574,9 +584,11 @@ static int dns_skip_name(const unsigned char *msg, int len, int off)
 }
 
 static void svcb_inject_hints(u_int16_t app_id, const char *host,
-                              const unsigned char *msg, int len)
+                              const unsigned char *msg, int len,
+                              struct nftnl_set **ps4, int *pc4,
+                              struct nftnl_set **ps6, int *pc6)
 {
-    if (len < 12 || !nft_nl)
+    if (len < 12)
         return;
     int qd = (msg[4] << 8) | msg[5];
     int an = (msg[6] << 8) | msg[7];
@@ -590,9 +602,6 @@ static void svcb_inject_hints(u_int16_t app_id, const char *host,
             return;
         off += 4;                               /* qtype + qclass */
     }
-
-    struct nftnl_set *s4 = NULL, *s6 = NULL;
-    int c4 = 0, c6 = 0;
 
     for (int i = 0; i < an; i++) {
         off = dns_skip_name(msg, len, off);
@@ -623,14 +632,18 @@ static void svcb_inject_hints(u_int16_t app_id, const char *host,
                     break;
                 if (k == 4) {                   /* ipv4hint : n × 4 octets */
                     for (int o = 0; o + 4 <= vlen; o += 4)
-                        if (set_add_elem(&s4, app_id, SET_V4,
-                                         msg + r + o, 4, ttl) == 0)
-                            c4++;
+                        if (set_add_elem(ps4, app_id, SET_V4,
+                                         msg + r + o, 4, ttl) == 0) {
+                            (*pc4)++;
+                            dbg_inject(host, app_id, AF_INET, msg + r + o);
+                        }
                 } else if (k == 6 && DNSTEERD_IPV6) {  /* ipv6hint : n × 16 */
                     for (int o = 0; o + 16 <= vlen; o += 16)
-                        if (set_add_elem(&s6, app_id, SET_V6,
-                                         msg + r + o, 16, ttl) == 0)
-                            c6++;
+                        if (set_add_elem(ps6, app_id, SET_V6,
+                                         msg + r + o, 16, ttl) == 0) {
+                            (*pc6)++;
+                            dbg_inject(host, app_id, AF_INET6, msg + r + o);
+                        }
                 }
                 r += vlen;
             }
@@ -638,8 +651,6 @@ static void svcb_inject_hints(u_int16_t app_id, const char *host,
         off += rdlen;
     }
 
-    if (s4 || s6)
-        inject_commit(app_id, s4, c4, s6, c6, host, "ipv4hint", "ipv6hint");
 }
 
 /* ================================================================
@@ -916,15 +927,22 @@ static int sdwan_nfq_cb(const struct nlmsghdr *nlh, void *data)
                         app_id != NDPI_PROTOCOL_DNS &&
                         app_id < PROTO_TABLE_SIZE &&
                         proto_has_set[app_id]) {
+                        struct nftnl_set *s4 = NULL, *s6 = NULL;
+                        int c4 = 0, c6 = 0;
                         if (nf->protos.dns.num_rsp_addr > 0)
-                            inject_ips(app_id, nf);
+                            inject_ips(app_id, nf, &s4, &c4, &s6, &c6);
                         /* Réponse à une question HTTPS RR (type 65) : nDPI
                          * n'extrait pas les ipv4hint des RDATA SVCB → on
                          * parcourt les answers nous-mêmes. */
                         if (nf->protos.dns.query_type == 65 &&
                             dns_off > 0 && dns_off < pktlen)
                             svcb_inject_hints(app_id, nf->host_server_name,
-                                              pkt + dns_off, pktlen - dns_off);
+                                              pkt + dns_off, pktlen - dns_off,
+                                              &s4, &c4, &s6, &c6);
+                        /* Un seul commit Netlink pour A/AAAA + hints SVCB. */
+                        if ((s4 || s6) && nft_nl)
+                            inject_commit(app_id, s4, c4, s6, c6,
+                                          nf->host_server_name);
                     }
 
                     /* Transaction terminée → purge l'entrée. APRÈS ce point,
@@ -1217,6 +1235,7 @@ static int do_daemon(int foreground)
     }
 
     openlog("dnsteerd",LOG_PID | LOG_NDELAY, LOG_DAEMON);
+    setlogmask(LOG_UPTO(g_debug ? LOG_DEBUG : LOG_INFO));
     write_pidfile();
 
     signal(SIGINT,  sig_handler);
@@ -1482,6 +1501,7 @@ static void usage(const char *prog)
         "\n"
         "Options:\n"
         "  -f       Foreground (daemon mode only)\n"
+        "  -d       Debug logs (daemon: log each injected IP)\n"
         "  -t       Plain-text output (set-elements mode only)\n"
         "  -h       This help\n",
         prog);
@@ -1493,9 +1513,10 @@ int main(int argc, char *argv[])
     int text_mode = 0;
     int opt;
 
-    while ((opt = getopt(argc, argv, "fth")) != -1) {
+    while ((opt = getopt(argc, argv, "fthd")) != -1) {
         switch (opt) {
         case 'f': foreground = 1; break;
+        case 'd': g_debug = 1; break;
         case 't': text_mode = 1; break;
         case 'h': usage(argv[0]); return 0;
         default:  usage(argv[0]); return 1;
